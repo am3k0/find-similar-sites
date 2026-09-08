@@ -197,6 +197,65 @@ def extract_redirect_targets(html):
     return targets
 
 
+def clean_target(target):
+    """Normalize JS-escaped redirect targets (\u0026 / &amp;)."""
+    return (target or "").replace("\\u0026", "&").replace("&amp;", "&")
+
+
+def fetch_page_text(url, timeout=12, allow_browser=True):
+    """Fetch a page through the fallback chain; browser-render when suspicious."""
+    result = net_utils.fetch(url, timeout=timeout)
+    text = (result.get("body") or b"").decode("utf-8", "replace")
+    path = result.get("path", "none")
+    if (result.get("intercepted") or not text
+            or (len(text) < 700 and re.search(r"<script", text, re.I))) and allow_browser:
+        try:
+            import browser_fetch
+            proxy = browser_fetch.pick_proxy("auto", url)
+            rendered = browser_fetch.render(url, proxy=proxy, timeout=28)
+            if rendered.get("dom"):
+                return rendered["dom"], f"browser({rendered.get('proxy')})"
+        except Exception:
+            pass
+    return text, path
+
+
+def collect_landing(targets):
+    """Fingerprint the seed's redirect landing (chain tail) for chain matching."""
+    for target in targets or []:
+        if not target.startswith("http"):
+            continue
+        text, path = fetch_page_text(target)
+        fp = page_fingerprint(text, target)
+        if not fp or not text:
+            continue
+        markers = extract_markers(text)[:4]
+        fp["markers"] = markers
+        return {
+            "url": target,
+            "host": host_of(target),
+            "fp": fp,
+            "markers": markers,
+            "text": text,
+            "fetch_path": path,
+        }
+    return None
+
+
+def _norm_css(classes):
+    """Normalize CSS class names: random hash suffixes -> '*' (cls_1df1d4a02282 -> cls_*)."""
+    return [re.sub(r"[0-9a-f]{10,}", "*", c) for c in (classes or [])]
+
+
+def _kit_signature(text):
+    """假新闻伪装跳转套件的指纹：article 组件族 / 随机哈希类 / 混淆跳转 token。"""
+    return {
+        "article_classes": sorted(set(re.findall(r"article-[a-z]+", text))),
+        "cls_hash": len(re.findall(r"cls_[0-9a-f]{10,}", text)),
+        "jump_prefix": len(re.findall(r"Ahr0Chm6lY93|aHR0cHM6Ly", text)),
+    }
+
+
 def query_cname(host, timeout=3):
     """Best-effort CNAME lookup via nslookup (Windows & Linux compatible-ish)."""
     try:
@@ -257,7 +316,10 @@ def collect_seed(url, verbose=False):
     seed["markers"] = extract_markers(text)
     if seed["fp"]:
         seed["fp"]["markers"] = seed["markers"][:4]
-    seed["js_targets"] = extract_redirect_targets(text)
+    seed["js_targets"] = [clean_target(t) for t in extract_redirect_targets(text)]
+
+    # 跳转落地页（链尾）指纹：用于"整链匹配"——候选的落地也必须是同类
+    seed["landing"] = collect_landing(seed["js_targets"])
 
     # Asset hosts: seed + HTTP redirect hops + JS/meta redirect targets.
     hosts = {seed["host"]}
@@ -327,18 +389,19 @@ def discover_candidates(seed, deadline, verbose=False):
     title = (seed.get("fp") or {}).get("title") or ""
     quake_ready = bool(config.get_quake_token())
 
-    def run_quake():
-        # Exclude the seed's own IPs (incl. redirect chain) server-side so
-        # candidates violating user rule R1 never enter the pool.
-        not_ips = ""
+    def not_ips():
+        """Server-side exclusion of the seed's own IPs (incl. redirect chain)."""
         seed_ips = sorted(seed.get("asset_ips") or [])[:6]
-        if seed_ips:
-            not_ips = " AND NOT (" + " OR ".join(f'ip:"{ip}"' for ip in seed_ips) + ")"
+        if not seed_ips:
+            return ""
+        return " AND NOT (" + " OR ".join(f'ip:"{ip}"' for ip in seed_ips) + ")"
+
+    def run_quake():
         queries = []
         if markers:
-            queries.append(("marker", f'response:"{markers[0]}"' + not_ips))
+            queries.append(("marker", f'response:"{markers[0]}"' + not_ips()))
             if len(markers) > 1:
-                queries.append(("marker2", f'response:"{markers[1]}"' + not_ips))
+                queries.append(("marker2", f'response:"{markers[1]}"' + not_ips()))
         if title:
             queries.append(("title", f'title:"{title}"'))
         for kind, query in queries:
@@ -361,6 +424,41 @@ def discover_candidates(seed, deadline, verbose=False):
                 return  # precise pivot found, stop burning quota
             if total == 0:
                 continue  # try the next marker
+
+    def run_quake_landing():
+        """反向 pivot：用种子落地页的 kit 标记找"跳转后同类"站点。"""
+        landing = seed.get("landing")
+        if not landing:
+            return
+        queries = []
+        for m in landing.get("markers") or []:
+            if len(m) >= 12:
+                queries.append(f'response:"{m}"' + not_ips())
+                break
+        for m in landing.get("markers") or []:
+            if "Ahr0Chm6" in m:
+                queries.append('response:"Ahr0Chm6lY93"' + not_ips())
+                break
+        for query in queries[:2]:
+            if time.time() > deadline:
+                return
+            result = quake_search.search(query, size=50)
+            total = result.get("total") or 0
+            log(f"quake landing-kit total={total} ({query[:44]}...)", verbose)
+            if 0 < total <= 5000:
+                for row in result.get("results") or []:
+                    host = row.get("domain") or row.get("hostname") or ""
+                    add(host, "quake:landing", {
+                        "ip": row.get("ip"), "title": row.get("title"),
+                        "country": row.get("country"), "province": row.get("province"),
+                    })
+                    if host:
+                        entry = candidates.get(registrable(host))
+                        if entry:
+                            entry["landing_pivot"] = True
+                return
+            if total == 0:
+                continue
 
     def run_hunter():
         queries = []
@@ -416,6 +514,8 @@ def discover_candidates(seed, deadline, verbose=False):
         jobs = []
         if quake_ready:
             jobs.append(pool.submit(run_quake))
+            if seed.get("landing"):
+                jobs.append(pool.submit(run_quake_landing))
         jobs.append(pool.submit(run_hunter))
         jobs.append(pool.submit(run_flint))
         for job in jobs:
@@ -446,6 +546,8 @@ def score_candidate(seed, entry):
     score = 0
     if entry.get("content_pivot"):
         score += 4
+    if entry.get("landing_pivot"):
+        score += 5  # 跳转后同类是高优先交付物
     if entry.get("infra_evidence"):
         score += 3
     title = (seed.get("fp") or {}).get("title")
@@ -478,7 +580,14 @@ def verify_candidate(seed, entry, use_browser="auto", verbose=False):
     if fp:
         fp["marker_hits"] = {m: text.count(m) for m in (seed.get("markers") or [])[:4] if text.count(m)}
     entry["fp"] = fp
+    entry["targets"] = [clean_target(t) for t in extract_redirect_targets(text)]
     entry["fetch_path"] = path
+    # 候选自身页面是否就是种子落地的同款套件（= 跳转后同类站）
+    if seed.get("landing") and text:
+        s, ev = landing_kit_score(seed, text, fp)
+        entry["landing_self"] = {"score": s, "matched": s >= 3, "evidence": ev}
+    else:
+        entry["landing_self"] = {"score": 0, "matched": False, "evidence": []}
     entry["favicon_sha256"] = favicon_fingerprint(entry["host"]) if fp else None
     if fp and entry["favicon_sha256"]:
         fp["favicon_sha256"] = entry["favicon_sha256"]
@@ -486,6 +595,121 @@ def verify_candidate(seed, entry, use_browser="auto", verbose=False):
 
 
 # ------------------------------------------------------------------ main
+
+def landing_kit_score(seed, text, lfp):
+    """候选页面 vs 种子落地套件的同类评分（动态内容下靠 kit 结构指纹）。"""
+    landing = seed["landing"]
+    sfp = landing["fp"]
+    stext = landing.get("text") or ""
+    if text.lstrip().startswith("<?xml") and "<Error>" in text[:300]:
+        return 0, ["落地已失效（存储返回 AccessDenied，令牌路径不可达）"]
+    ev = []
+    score = 0
+    cs = css_similarity(_norm_css(sfp.get("css_classes")), _norm_css(lfp.get("css_classes")))
+    if cs >= 0.60:
+        score += 3
+        ev.append(f"落地CSS结构相似 {round(cs * 100)}%（归一化随机哈希类后）")
+    ssig, csig = _kit_signature(stext), _kit_signature(text)
+    shared = sorted(set(ssig["article_classes"]) & set(csig["article_classes"]))
+    if len(shared) >= 3:
+        score += 2
+        ev.append(f"落地同款article组件 {shared[:4]}")
+    if ssig["cls_hash"] and csig["cls_hash"]:
+        score += 1
+        ev.append(f"落地同款随机哈希类 cls_*（候选 {csig['cls_hash']} 处）")
+    if ssig["jump_prefix"] and csig["jump_prefix"]:
+        score += 2
+        ev.append("落地含同款混淆跳转token（Ahr0Chm6lY93/aHR0cHM6Ly）")
+    ds = dom_similarity(sfp.get("dom_top"), lfp.get("dom_top"))
+    if ds >= 0.80:
+        score += 2
+        ev.append(f"落地DOM相似 {round(ds * 100)}%")
+    if lfp["sha256"] == sfp["sha256"]:
+        score += 4
+        ev.append("落地正文完全一致")
+    elif sfp.get("title") and sfp["title"] == lfp["title"]:
+        score += 1.5
+        ev.append(f"落地标题一致 {lfp['title'][:22]!r}")
+    return score, ev
+
+
+def check_landing(seed, entry):
+    """整链校验：跟随候选的跳转，其落地页必须与种子落地页同类（同款伪装套件）。"""
+    landing = seed.get("landing")
+    if not landing:
+        entry["landing_verdict"] = {"required": False, "matched": True,
+                                    "evidence": ["种子无可用落地页，仅网关匹配"]}
+        return entry
+    entry["landing_verdict"] = {"required": True, "matched": False, "evidence": []}
+    for target in (entry.get("targets") or [])[:3]:
+        if not target.startswith("http"):
+            continue
+        text, path = fetch_page_text(target)
+        lfp = page_fingerprint(text, target)
+        if not lfp:
+            continue
+        lfp["markers"] = extract_markers(text)[:4]
+        entry["landing_url"] = target
+        entry["landing_fp"] = lfp
+        entry["landing_fetch_path"] = path
+        entry["landing_ips"] = [ip for ip in net_utils.resolve(host_of(target))
+                                if ip not in net_utils.POISONED_DNS]
+        score, ev = landing_kit_score(seed, text, lfp)
+        overlap = set(entry.get("landing_ips") or []) & set(seed.get("asset_ips") or [])
+        if overlap:
+            ev.append(f"⚠ 落地与种子共享基础设施: {','.join(sorted(overlap))}")
+        entry["landing_verdict"] = {
+            "required": True, "matched": score >= 3, "score": score,
+            "evidence": ev or ["落地内容无相似证据"],
+        }
+        return entry
+    entry["landing_verdict"]["evidence"] = ["候选无可用跳转落地"]
+    return entry
+
+
+def find_landing_siblings(seed, deadline, verbose=False):
+    """落地舰队兄弟：同根域的其他子域 + 种子落地路径 = 跳转后同类 URL。
+
+    令牌门控的落地舰队通常按"子域+路径形状"路由，令牌值任意；
+    换兄弟子域复用种子落地路径即可取出同款套件页面。
+    """
+    landing = seed.get("landing")
+    if not landing:
+        return []
+    labels = landing["host"].split(".")
+    root = ".".join(labels[-2:]) if len(labels) >= 2 else landing["host"]
+    try:
+        result = quake_search.search(f'domain:"{root}"', size=30)
+    except Exception as error:
+        log(f"landing sibling quake skipped: {error!r}", verbose)
+        return []
+    hosts = []
+    for row in result.get("results") or []:
+        h = (row.get("domain") or "").lower().rstrip(".")
+        if h and h != landing["host"] and h.endswith(root) and h not in hosts:
+            hosts.append(h)
+    log(f"landing fleet: root={root} siblings={len(hosts)}", verbose)
+    suffix = landing["url"].split(landing["host"], 1)[-1]
+    out = []
+    for h in hosts[:6]:
+        if time.time() > deadline:
+            break
+        url = f"http://{h}{suffix}"
+        text, path_used = fetch_page_text(url)
+        fp2 = page_fingerprint(text, url)
+        if not fp2:
+            continue
+        score, ev = landing_kit_score(seed, text, fp2)
+        ips = [ip for ip in net_utils.resolve(h) if ip not in net_utils.POISONED_DNS]
+        out.append({
+            "url": url, "host": h, "ips": ips, "score": score,
+            "matched": score >= 3, "evidence": ev,
+            "title": fp2.get("title", ""), "fetch_path": path_used,
+        })
+        log(f"sibling {h}: score={score} bytes={len(text)}", verbose)
+    out.sort(key=lambda x: -x["score"])
+    return out
+
 
 def main():
     parser = argparse.ArgumentParser(description="快速查找同类站点（结果直接打印，不生成文件）")
@@ -513,6 +737,13 @@ def main():
           f"/ 跳转链 {sorted(seed['asset_hosts'])}", flush=True)
     if seed.get("prefer_overseas"):
         print("  规则R2: 种子为国内IP → 候选优先境外(含港澳台)", flush=True)
+    landing = seed.get("landing")
+    if landing:
+        print(f"  种子落地: {landing['url'][:76]}", flush=True)
+        print(f"    落地标题={landing['fp'].get('title', '')[:26]!r} 采集:{landing['fetch_path']} "
+              f"标记:{landing['markers'][:3]}", flush=True)
+    else:
+        print("  种子落地: 不可用（将只做网关匹配）", flush=True)
 
     discovery_deadline = min(deadline, started + args.budget * 0.45)
     candidates = discover_candidates(seed, discovery_deadline, verbose=args.verbose)
@@ -562,11 +793,18 @@ def main():
         print("❌ 候选全部与种子同IP/CNAME，无合格同类站点。")
         return 1
 
-    # Verify in batches, first hit wins
+    # Verify in batches. Categories:
+    #   full       — 网关同类 + 候选的跳转落地也是种子落地同类（整链同类）
+    #   landing_kind — 候选自身页面就是种子落地套件同款（= 跳转后同类站）
+    #   gateway_only — 仅网关同类，落地不匹配/失效
     passed_list = []
+    landing_kind_list = []
+    gateway_only = []
     near_misses = []
     to_verify = qualified_pool[:args.max_verify]
-    print(f"◎ 验证: 依次核验前 {len(to_verify)} 个候选（真实页面比对）", flush=True)
+    chain = bool(seed.get("landing"))
+    print(f"◎ 验证: 依次核验前 {len(to_verify)} 个候选"
+          + ("（网关+落地 整链比对）" if chain else "（真实页面比对）"), flush=True)
     for batch_start in range(0, len(to_verify), 4):
         if time.time() > deadline:
             print("⏱ 达到时间预算，提前结束验证。", flush=True)
@@ -590,20 +828,67 @@ def main():
                     is_cn, _ = net_utils.is_china_ip(ip)
                     mainland = mainland or is_cn
                 mark = "" if not mainland else " [国内IP]"
-            if verdict["passed"]:
-                passed_list.append((entry, verdict, where, mark))
-                if not args.all:
-                    entry_idx = passed_list[-1]
-                    print_result(seed, *entry_idx)
-                    return 0
-            else:
+
+            ls = entry.get("landing_self") or {}
+            if chain and not verdict["passed"] and ls.get("matched"):
+                landing_kind_list.append((entry, verdict, where, mark))
+                continue
+            if not verdict["passed"]:
                 near_misses.append((entry, verdict, where))
+                continue
+            if chain:
+                check_landing(seed, entry)
+                lv = entry.get("landing_verdict") or {}
+                if not lv.get("matched"):
+                    gateway_only.append((entry, verdict, where, mark))
+                    continue
+            passed_list.append((entry, verdict, where, mark))
+            if not args.all:
+                print_result(seed, entry, verdict, where, mark)
+                return 0
 
     if passed_list:
-        print(f"◎ 共 {len(passed_list)} 个合格同类站点:", flush=True)
+        print(f"◎ 共 {len(passed_list)} 个整链匹配的同类站点:", flush=True)
         for entry, verdict, where, mark in passed_list:
             print_result(seed, entry, verdict, where, mark, prefix="  -")
-        return 0
+        if not (args.all and landing_kind_list):
+            return 0
+        print(flush=True)
+
+    if landing_kind_list:
+        print(f"◎ 跳转后同类（与种子落地同款套件的站点）: {len(landing_kind_list)} 个:", flush=True)
+        for entry, verdict, where, mark in landing_kind_list[:6]:
+            ls = entry.get("landing_self") or {}
+            print(f"  - http://{entry['host']}{mark} ({where or '未知归属'}) "
+                  f"IP: {','.join((entry.get('ips') or [])[:2])}", flush=True)
+            print(f"      落地证据: {'; '.join(ls.get('evidence') or [])[:110]}", flush=True)
+            print(f"      采集: {entry.get('fetch_path')}", flush=True)
+        if not passed_list:
+            return 0
+        print(flush=True)
+
+    if gateway_only:
+        print("❌ 有网关同类、但跳转落地不匹配（未达到整链同类）:", flush=True)
+        for entry, verdict, where, mark in gateway_only[:5]:
+            lv = entry.get("landing_verdict") or {}
+            ev = "; ".join(lv.get("evidence") or [])[:88]
+            print(f"  - {entry['host']} → {str(entry.get('landing_url') or '无落地')[:60]} — {ev}", flush=True)
+
+    # 整链无解时：交付"跳转后同类"——落地舰队的兄弟子域
+    if chain and not passed_list and time.time() < deadline:
+        print("◎ 尝试落地舰队兄弟子域（同根域、同路径形状 = 跳转后同类）...", flush=True)
+        sib = find_landing_siblings(seed, deadline, verbose=args.verbose)
+        sib = [s for s in sib if s["matched"]]
+        if sib:
+            seed_landing_ips = set(net_utils.resolve(seed["landing"]["host"]))
+            print(f"◎ 跳转后同类: {len(sib)} 个可用（同款落地套件）:", flush=True)
+            for s in sib[:4]:
+                overlap = set(s["ips"] or []) & seed_landing_ips
+                note = "⚠ 与种子落地共享CDN边缘IP（域名/站点不同）" if overlap else ""
+                print(f"  - {s['url']}", flush=True)
+                print(f"      IP: {','.join(s['ips'][:2])} {note} | 采集: {s['fetch_path']}", flush=True)
+                print(f"      证据: {'; '.join(s['evidence'])[:120]}", flush=True)
+            return 0
 
     print("❌ 未找到完全合格的同类站点。最接近的候选:", flush=True)
     for entry, verdict, where in near_misses[:5]:
@@ -616,9 +901,15 @@ def print_result(seed, entry, verdict, where, mark="", prefix=""):
     lines = [
         f"{prefix}✅ 同类站点: http://{entry['host']}{mark}",
         f"{prefix}   IP: {', '.join(entry.get('ips') or [])} ({where or '未知归属'}) | 采集: {entry.get('fetch_path')}",
-        f"{prefix}   证据: {'; '.join(r for r in verdict['reasons'] if r.startswith('R3')) or '基础设施关联'}",
-        f"{prefix}   合规: IP/CNAME 与种子及跳转链无交集 | 级别: {verdict['level']} | 分数 {verdict['score']}",
+        f"{prefix}   网关证据: {'; '.join(r for r in verdict['reasons'] if r.startswith('R3')) or '基础设施关联'}",
     ]
+    lv = entry.get("landing_verdict") or {}
+    if lv.get("required"):
+        lines.append(f"{prefix}   跳转落地: {str(entry.get('landing_url') or '（无落地）')[:76]}")
+        if entry.get("landing_ips"):
+            lines.append(f"{prefix}   落地IP: {', '.join(entry['landing_ips'][:3])}")
+        lines.append(f"{prefix}   落地证据: {'; '.join(lv.get('evidence') or []) or '-'}")
+    lines.append(f"{prefix}   合规: IP/CNAME 与种子及跳转链无交集 | 级别: {verdict['level']} | 分数 {verdict['score']}")
     print("\n".join(lines), flush=True)
 
 
