@@ -1,0 +1,4 @@
+interface:
+  display_name: "Find Similar Sites"
+  short_description: "Find same-CMS and campaign-related sites"
+  default_prompt: "Use $find-similar-sites to fingerprint this site, search Hunter and public sources, and validate same-CMS candidates."
