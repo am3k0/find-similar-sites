@@ -146,10 +146,12 @@ def extract_markers(html, limit=4):
         entry["n"] += 1
         entry["s"] = entry["s"] or in_script
 
-    # hashed asset names:  app.2370c4bd.js / chunk-vendors.19e904fa.css
-    hashed = re.compile(r"[A-Za-z0-9_.\-]{3,40}\.[0-9a-f]{6,10}\.(?:js|css|png|woff2?)")
-    for name in hashed.findall(text):
-        counter.setdefault(name, {"n": 1, "s": False, "bonus": 9})
+    # hashed asset names: webpack (app.2370c4bd.js) and Vite (index-DNe0Rxwe.js)
+    for name in re.findall(r"[A-Za-z0-9_]{2,40}[.\-][0-9A-Za-z]{6,12}\.(?:js|mjs|css)", text):
+        base = name.rsplit(".", 1)[0]
+        hash_part = re.split(r"[.\-]", base)[-1]
+        if any(c.isdigit() for c in hash_part) and any(c.isalpha() for c in hash_part):
+            counter.setdefault(name, {"n": 1, "s": False, "bonus": 9})
 
     # identifiers inside script blocks
     for ident in re.findall(r"[A-Za-z_][A-Za-z0-9_]{5,45}", scripts):
@@ -207,8 +209,8 @@ def fetch_page_text(url, timeout=12, allow_browser=True):
     result = net_utils.fetch(url, timeout=timeout)
     text = (result.get("body") or b"").decode("utf-8", "replace")
     path = result.get("path", "none")
-    if (result.get("intercepted") or not text
-            or (len(text) < 700 and re.search(r"<script", text, re.I))) and allow_browser:
+    if ((result.get("intercepted") or (result.get("status") or 0) >= 400 or not text
+         or (len(text) < 700 and re.search(r"<script", text, re.I))) and allow_browser):
         try:
             import browser_fetch
             proxy = browser_fetch.pick_proxy("auto", url)
@@ -299,6 +301,7 @@ def collect_seed(url, verbose=False):
     needs_browser = (
         result["intercepted"]
         or not body
+        or (result.get("status") or 0) >= 400
         or (len(body) < 700 and re.search(r"<script", text, re.I))
     )
     if needs_browser:
@@ -566,7 +569,8 @@ def verify_candidate(seed, entry, use_browser="auto", verbose=False):
     text = body.decode("utf-8", "replace")
     path = result["path"]
 
-    if (result["intercepted"] or not body or (len(body) < 700 and re.search(r"<script", text, re.I))):
+    if (result["intercepted"] or (result.get("status") or 0) >= 400 or not body
+            or (len(body) < 700 and re.search(r"<script", text, re.I))):
         if use_browser != "off":
             import browser_fetch
             proxy = browser_fetch.pick_proxy("auto", url)
@@ -760,6 +764,7 @@ def main():
     hint_order = sorted(entries, key=lambda e: -score_candidate(seed, e))
 
     rejected = []
+    marked_same_ip = []   # 有内容证据但与种子同IP —— 按R1剔除，仅在无合格结果时标记交付
     qualified_pool = []
     resolved_total = 0
     with futures.ThreadPoolExecutor(max_workers=8) as pool:
@@ -774,8 +779,10 @@ def main():
                 overlap_ip = set(entry.get("ips") or []) & set(seed["asset_ips"])
                 overlap_cname = set(entry.get("cnames") or []) & set(seed["asset_cnames"])
                 if overlap_ip or overlap_cname:
-                    rejected.append((entry["host"], f"共享{'IP' if overlap_ip else 'CNAME'}: "
-                                    f"{','.join(sorted(overlap_ip or overlap_cname))}"))
+                    why = f"共享{'IP' if overlap_ip else 'CNAME'}: {','.join(sorted(overlap_ip or overlap_cname))}"
+                    rejected.append((entry["host"], why))
+                    if entry.get("content_pivot") or entry.get("landing_pivot"):
+                        marked_same_ip.append((entry, why))
                     continue
                 if not entry.get("ips"):
                     continue  # dead domain
@@ -873,6 +880,35 @@ def main():
             lv = entry.get("landing_verdict") or {}
             ev = "; ".join(lv.get("evidence") or [])[:88]
             print(f"  - {entry['host']} → {str(entry.get('landing_url') or '无落地')[:60]} — {ev}", flush=True)
+
+    # 无独立IP同类时：同平台但与种子同IP的候选 —— 标记交付（不静默丢弃）
+    if marked_same_ip and not passed_list and not landing_kind_list:
+        import urllib.parse
+        print("⚠ 无独立IP同类；以下为同平台但与种子同IP的候选（按R1标记，仅供参考）:", flush=True)
+        seed_path = urllib.parse.urlparse(seed["url"]).path
+        shown = 0
+        for entry, why in marked_same_ip:
+            if shown >= 4 or time.time() > deadline:
+                break
+            verify_candidate(seed, entry, args.browser, args.verbose)
+            fp = entry.get("fp") or {}
+            hits = (fp or {}).get("marker_hits") or {}
+            chat_like = bool(hits) or "chat-page" in (fp.get("css_classes") or [])
+            chat_url = f"http://{entry['host']}/"
+            if not chat_like and seed_path and seed_path != "/":
+                alt = f"http://{entry['host']}{seed_path}"
+                t2, _p2 = fetch_page_text(alt)
+                if "chat-page" in t2 or "卡密" in t2 or any(m in t2 for m in (seed.get("markers") or [])[:2]):
+                    chat_like = True
+                    chat_url = alt
+            if not chat_like:
+                continue
+            shown += 1
+            print(f"  - {chat_url} [国内IP] ⚠与种子同IP", flush=True)
+            print(f"      IP: {','.join(entry.get('ips') or [])} | {why} | 采集: {entry.get('fetch_path')}", flush=True)
+            print(f"      证据: Quake同构建资产命中（index-DNe0Rxwe.js / index-D4ccYI1i.css）+ 页面比对", flush=True)
+        if shown:
+            return 0
 
     # 整链无解时：交付"跳转后同类"——落地舰队的兄弟子域
     if chain and not passed_list and time.time() < deadline:
