@@ -34,6 +34,7 @@ BROWSER_CANDIDATES = [
 CHROME_FLAGS = [
     "--headless=new", "--disable-gpu", "--no-first-run", "--no-default-browser-check",
     "--disable-extensions", "--disable-background-networking", "--mute-audio",
+    "--dump-dom",
 ]
 
 
