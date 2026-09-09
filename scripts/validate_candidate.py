@@ -123,8 +123,9 @@ def validate(seed, cand):
                 "geo_note": "", "score": 0}
     reasons.append(f"R1 通过：IP/CNAME 与种子资产集无交集（种子 {len(seed_ips)} IP/{len(seed_cnames)} CNAME）")
 
-    # R3 — content evidence
+    # R3 — content evidence (must qualify on its own; R2 geo only ranks)
     score, evidence = content_evidence(seed.get("fp"), cand.get("fp"))
+    content_score = score
     if evidence:
         reasons.extend(f"R3 {line}" for line in evidence)
     else:
@@ -135,16 +136,18 @@ def validate(seed, cand):
     reasons.append(f"R2 {note}")
     score += bonus
 
-    if score >= 4:
+    if content_score >= 4:
         level = "same_content"
-    elif score >= 2:
+    elif content_score >= 2:
         level = "same_template"
+    elif content_score >= 1:
+        level = "weak_match"
     elif cand.get("infra_evidence"):
         level = "infra_related"
         reasons.append(f"基础设施证据：{cand.get('infra_evidence')}")
     else:
         level = "unverified"
-    return {"passed": score >= 2, "level": level, "reasons": reasons,
+    return {"passed": content_score >= 2, "level": level, "reasons": reasons,
             "geo_note": note, "score": score}
 
 
